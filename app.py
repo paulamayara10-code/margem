@@ -34,6 +34,7 @@ POSITIVE = "#138A5B"
 NEGATIVE = "#CF3E4B"
 WARNING = "#D98E04"
 GRAY = "#6B7280"
+APP_DIR = Path(__file__).resolve().parent
 
 st.markdown(
     f"""
@@ -175,10 +176,23 @@ def first_existing(columns: Iterable[str], candidates: Iterable[str]) -> str | N
 
 
 def local_source(candidates: list[str]) -> SourceFile | None:
+    search_roots = [Path.cwd(), APP_DIR, APP_DIR / "bases"]
+    checked: set[Path] = set()
     for candidate in candidates:
-        path = Path(candidate)
-        if path.exists() and path.is_file():
-            return SourceFile(path.name, path.read_bytes())
+        candidate_path = Path(candidate)
+        paths = [candidate_path] if candidate_path.is_absolute() else [
+            root / candidate_path for root in search_roots
+        ]
+        for path in paths:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            if resolved in checked:
+                continue
+            checked.add(resolved)
+            if path.exists() and path.is_file():
+                return SourceFile(path.name, path.read_bytes())
     return None
 
 
@@ -250,11 +264,12 @@ def prepare_sales(raw: pd.DataFrame) -> pd.DataFrame:
         "Cliente": ["Nome Cliente", "Razao Social"],
         "UF": ["Estado", "UF"],
         "Vendedor": ["Nome", "Nome Vendedor", "Vendedor"],
+        "Gerente": ["Gerente", "Nome Espec.", "Nome Espec", "Especialista"],
         "Produto": ["Produto"],
         "Descricao_Produto": ["Descricao"],
         "Quantidade": ["Quantidade"],
-        "Preco_Vendido": ["Prc Unitario", "Preco Unitario"],
-        "Valor_Venda": ["Vlr.Total", "Valor Total"],
+        "Preco_Unitario_Informado": ["Prc Unitario", "Preco Unitario"],
+        "Valor_Liquido": ["Vlr.Total", "Valor Total"],
         "Valor_Bruto": ["Valor Bruto"],
         "Condicao_Pagamento": ["Cond. Pagto", "Condicao Pagamento"],
         "Descricao_Condicao": ["Descricao.1"],
@@ -271,13 +286,28 @@ def prepare_sales(raw: pd.DataFrame) -> pd.DataFrame:
     out = out[out["Finalidade_Normalizada"].str.startswith("VENDA")].copy()
 
     out["Data"] = parse_excel_dates(out["Data"])
-    for column in ["Quantidade", "Preco_Vendido", "Valor_Venda", "Valor_Bruto"]:
+    for column in ["Quantidade", "Preco_Unitario_Informado", "Valor_Liquido", "Valor_Bruto"]:
         out[column] = to_numeric(out[column])
 
     out["Quantidade"] = out["Quantidade"].fillna(0)
-    out["Preco_Vendido"] = out["Preco_Vendido"].fillna(0)
-    calculated_total = out["Quantidade"] * out["Preco_Vendido"]
-    out["Valor_Venda"] = out["Valor_Venda"].where(out["Valor_Venda"].fillna(0) != 0, calculated_total)
+    out["Preco_Unitario_Informado"] = out["Preco_Unitario_Informado"].fillna(0)
+    calculated_total = out["Quantidade"] * out["Preco_Unitario_Informado"]
+    out["Valor_Liquido"] = out["Valor_Liquido"].where(
+        out["Valor_Liquido"].fillna(0) != 0, calculated_total
+    )
+    out["Valor_Bruto"] = out["Valor_Bruto"].fillna(0)
+
+    # Regra principal solicitada: o realizado é o Valor Bruto do item.
+    # O fallback só é usado quando o relatório vier sem Valor Bruto.
+    out["Valor_Realizado"] = out["Valor_Bruto"].where(
+        out["Valor_Bruto"] > 0, out["Valor_Liquido"]
+    )
+    out["Fonte_Valor_Realizado"] = np.where(
+        out["Valor_Bruto"] > 0, "VALOR BRUTO", "VLR.TOTAL (FALLBACK)"
+    )
+    out["Preco_Realizado_Bruto"] = np.where(
+        out["Quantidade"] > 0, out["Valor_Realizado"] / out["Quantidade"], np.nan
+    )
 
     for column in [
         "Segmento",
@@ -286,6 +316,7 @@ def prepare_sales(raw: pd.DataFrame) -> pd.DataFrame:
         "Cliente",
         "UF",
         "Vendedor",
+        "Gerente",
         "Produto",
         "Descricao_Produto",
         "Condicao_Pagamento",
@@ -294,10 +325,11 @@ def prepare_sales(raw: pd.DataFrame) -> pd.DataFrame:
     ]:
         out[column] = out[column].fillna("").astype(str).str.strip()
 
+    out["Gerente"] = out["Gerente"].replace("", "NÃO INFORMADO")
     out["UF"] = out["UF"].map(normalize_text)
     out["Produto_Canonico"] = out["Produto"].map(canonical_code)
     out["Produto_Base"] = out["Produto"].map(base_code)
-    out = out[(out["Produto_Canonico"] != "") & (out["Preco_Vendido"] > 0)].copy()
+    out = out[(out["Produto_Canonico"] != "") & (out["Valor_Realizado"] > 0)].copy()
     out.reset_index(drop=True, inplace=True)
     return out
 
@@ -366,6 +398,54 @@ def prepare_manual_mapping(uploaded: Any) -> dict[str, str]:
         for source, target in mapping_df.itertuples(index=False, name=None)
         if canonical_code(source) and str(target).strip()
     }
+
+
+def prepare_manager_mapping(source: SourceFile | None) -> dict[str, str]:
+    if source is None:
+        return {}
+    try:
+        if source.name.lower().endswith(".csv"):
+            mapping_df = pd.read_csv(
+                io.BytesIO(source.content), sep=None, engine="python", dtype=str
+            )
+        else:
+            mapping_df = pd.read_excel(
+                io.BytesIO(source.content), dtype=str, engine="openpyxl"
+            )
+    except Exception:
+        return {}
+
+    mapping_df.columns = [clean_column_name(c) for c in mapping_df.columns]
+    seller_col = first_existing(mapping_df.columns, ["Vendedor", "Nome Vendedor"])
+    manager_col = first_existing(mapping_df.columns, ["Gerente", "Nome Gerente"])
+    if not seller_col or not manager_col:
+        return {}
+
+    mapping_df = mapping_df[[seller_col, manager_col]].fillna("")
+    result: dict[str, str] = {}
+    for seller, manager in mapping_df.itertuples(index=False, name=None):
+        seller_key = normalize_text(seller)
+        manager_name = str(manager).strip()
+        if seller_key and manager_name:
+            result[seller_key] = manager_name
+    return result
+
+
+def apply_manager_mapping(sales: pd.DataFrame, manager_mapping: dict[str, str]) -> pd.DataFrame:
+    result = sales.copy()
+    result["Gerente_Origem"] = np.where(
+        result["Gerente"].eq("NÃO INFORMADO"),
+        "NÃO INFORMADO",
+        "RELATÓRIO — NOME ESPEC.",
+    )
+    if not manager_mapping:
+        return result
+
+    mapped = result["Vendedor"].map(normalize_text).map(manager_mapping)
+    mask = mapped.notna() & mapped.astype(str).str.strip().ne("")
+    result.loc[mask, "Gerente"] = mapped.loc[mask].astype(str).str.strip()
+    result.loc[mask, "Gerente_Origem"] = "MAPA FIXO DO GIT"
+    return result
 
 
 def select_latest(records: pd.DataFrame) -> pd.Series:
@@ -485,16 +565,16 @@ def compare_prices(
 
     result = pd.DataFrame(rows)
     result["Valor_Tabela"] = result["Preco_Tabela"] * result["Quantidade"]
-    result["Diferenca_Unit"] = result["Preco_Vendido"] - result["Preco_Tabela"]
-    result["Impacto_Total"] = result["Valor_Venda"] - result["Valor_Tabela"]
+    result["Diferenca_Total"] = result["Valor_Realizado"] - result["Valor_Tabela"]
+    result["Impacto_Total"] = result["Diferenca_Total"]
     result["Variacao"] = np.where(
-        result["Preco_Tabela"] > 0,
-        result["Preco_Vendido"] / result["Preco_Tabela"] - 1,
+        result["Valor_Tabela"] > 0,
+        result["Valor_Realizado"] / result["Valor_Tabela"] - 1,
         np.nan,
     )
     result["Indice_Preco"] = np.where(
-        result["Preco_Tabela"] > 0,
-        result["Preco_Vendido"] / result["Preco_Tabela"],
+        result["Valor_Tabela"] > 0,
+        result["Valor_Realizado"] / result["Valor_Tabela"],
         np.nan,
     )
     result["Status"] = result["Variacao"].map(classify_variation)
@@ -502,12 +582,15 @@ def compare_prices(
     return result
 
 
+@st.cache_data(show_spinner=False)
 def make_excel_export(analysis: pd.DataFrame) -> bytes:
-    valid = analysis[analysis["Preco_Tabela"].notna()].copy()
+    valid = analysis[
+        analysis["Preco_Tabela"].notna() & (analysis["Valor_Tabela"] > 0)
+    ].copy()
     by_seller = (
-        valid.groupby("Vendedor", dropna=False)
+        valid.groupby(["Vendedor", "Gerente"], dropna=False)
         .agg(
-            Faturamento=("Valor_Venda", "sum"),
+            Faturamento_Bruto=("Valor_Realizado", "sum"),
             Valor_Tabela=("Valor_Tabela", "sum"),
             Impacto=("Impacto_Total", "sum"),
             Itens=("Produto", "size"),
@@ -516,7 +599,23 @@ def make_excel_export(analysis: pd.DataFrame) -> bytes:
     )
     by_seller["Variacao_Ponderada"] = np.where(
         by_seller["Valor_Tabela"] != 0,
-        by_seller["Faturamento"] / by_seller["Valor_Tabela"] - 1,
+        by_seller["Faturamento_Bruto"] / by_seller["Valor_Tabela"] - 1,
+        np.nan,
+    )
+
+    by_manager = (
+        valid.groupby("Gerente", dropna=False)
+        .agg(
+            Faturamento_Bruto=("Valor_Realizado", "sum"),
+            Valor_Tabela=("Valor_Tabela", "sum"),
+            Impacto=("Impacto_Total", "sum"),
+            Itens=("Produto", "size"),
+        )
+        .reset_index()
+    )
+    by_manager["Variacao_Ponderada"] = np.where(
+        by_manager["Valor_Tabela"] != 0,
+        by_manager["Faturamento_Bruto"] / by_manager["Valor_Tabela"] - 1,
         np.nan,
     )
 
@@ -524,7 +623,7 @@ def make_excel_export(analysis: pd.DataFrame) -> bytes:
         valid.groupby(["Produto", "Produto_Tabela", "Descricao_Produto"], dropna=False)
         .agg(
             Quantidade=("Quantidade", "sum"),
-            Faturamento=("Valor_Venda", "sum"),
+            Faturamento_Bruto=("Valor_Realizado", "sum"),
             Valor_Tabela=("Valor_Tabela", "sum"),
             Impacto=("Impacto_Total", "sum"),
         )
@@ -532,19 +631,23 @@ def make_excel_export(analysis: pd.DataFrame) -> bytes:
     )
     by_product["Variacao_Ponderada"] = np.where(
         by_product["Valor_Tabela"] != 0,
-        by_product["Faturamento"] / by_product["Valor_Tabela"] - 1,
+        by_product["Faturamento_Bruto"] / by_product["Valor_Tabela"] - 1,
         np.nan,
     )
 
-    pending = analysis[analysis["Preco_Tabela"].isna()].copy()
+    pending = analysis[
+        analysis["Preco_Tabela"].isna() | (analysis["Valor_Tabela"] <= 0)
+    ].copy()
 
     export_columns = [
         "Data", "Nota_Fiscal", "Pedido", "Finalidade", "Segmento", "Cliente_Codigo",
-        "Cliente", "UF", "Vendedor", "Produto", "Produto_Tabela", "Descricao_Produto",
-        "Grupo", "Linha", "Classificacao", "Quantidade", "Preco_Vendido", "Preco_Tabela",
-        "Valor_Venda", "Valor_Tabela", "Diferenca_Unit", "Impacto_Total", "Variacao",
-        "Status", "Metodo_Cruzamento", "Candidatos", "Tipo_Preco", "Coluna_Referencia",
-        "Atualizado_Em",
+        "Cliente", "UF", "Vendedor", "Gerente", "Produto", "Produto_Tabela",
+        "Descricao_Produto", "Grupo", "Linha", "Classificacao", "Quantidade",
+        "Preco_Unitario_Informado", "Preco_Realizado_Bruto", "Preco_Tabela",
+        "Valor_Liquido", "Valor_Bruto", "Valor_Realizado", "Valor_Tabela",
+        "Diferenca_Total", "Impacto_Total", "Variacao", "Status",
+        "Fonte_Valor_Realizado", "Gerente_Origem", "Metodo_Cruzamento", "Candidatos", "Tipo_Preco",
+        "Coluna_Referencia", "Atualizado_Em",
     ]
     export_data = analysis[[c for c in export_columns if c in analysis.columns]].copy()
 
@@ -552,6 +655,7 @@ def make_excel_export(analysis: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="dd/mm/yyyy") as writer:
         export_data.to_excel(writer, sheet_name="Analise_Detalhada", index=False)
         by_seller.to_excel(writer, sheet_name="Resumo_Vendedor", index=False)
+        by_manager.to_excel(writer, sheet_name="Resumo_Gerente", index=False)
         by_product.to_excel(writer, sheet_name="Resumo_Produto", index=False)
         pending.to_excel(writer, sheet_name="Pendencias", index=False)
 
@@ -563,25 +667,34 @@ def make_excel_export(analysis: pd.DataFrame) -> bytes:
         percent_format = workbook.add_format({"num_format": '0.0%;[Red]-0.0%'})
         date_format = workbook.add_format({"num_format": "dd/mm/yyyy"})
 
-        for sheet_name, dataframe in {
+        sheets = {
             "Analise_Detalhada": export_data,
             "Resumo_Vendedor": by_seller,
+            "Resumo_Gerente": by_manager,
             "Resumo_Produto": by_product,
             "Pendencias": pending,
-        }.items():
+        }
+        for sheet_name, dataframe in sheets.items():
             worksheet = writer.sheets[sheet_name]
             worksheet.freeze_panes(1, 0)
-            worksheet.autofilter(0, 0, max(len(dataframe), 1), max(len(dataframe.columns) - 1, 0))
+            if len(dataframe.columns) > 0:
+                worksheet.autofilter(
+                    0, 0, max(len(dataframe), 1), len(dataframe.columns) - 1
+                )
             worksheet.set_row(0, 24, header_format)
             for idx, column in enumerate(dataframe.columns):
                 width = min(max(len(str(column)) + 2, 12), 34)
-                sample = dataframe[column].astype(str).head(200)
-                if not sample.empty:
-                    width = min(max(width, int(sample.str.len().quantile(0.9)) + 2), 38)
+                sample = dataframe[column].astype("string").head(200)
+                lengths = sample.str.len().replace([np.inf, -np.inf], np.nan).dropna()
+                if not lengths.empty:
+                    q90 = lengths.quantile(0.90)
+                    if pd.notna(q90):
+                        width = min(max(width, int(q90) + 2), 38)
                 fmt = None
                 if column in {
-                    "Preco_Vendido", "Preco_Tabela", "Valor_Venda", "Valor_Tabela",
-                    "Diferenca_Unit", "Impacto_Total", "Faturamento", "Impacto",
+                    "Preco_Unitario_Informado", "Preco_Realizado_Bruto", "Preco_Tabela",
+                    "Valor_Liquido", "Valor_Bruto", "Valor_Realizado", "Valor_Tabela",
+                    "Diferenca_Total", "Impacto_Total", "Faturamento_Bruto", "Impacto",
                 }:
                     fmt = currency_format
                 elif column in {"Variacao", "Variacao_Ponderada"}:
@@ -623,7 +736,7 @@ st.markdown(
     """
     <div class="hero">
         <h1>First Pricing Intelligence</h1>
-        <p>Comparativo entre tabela de preços e operações faturadas de venda</p>
+        <p>Comparativo do valor bruto faturado com o valor equivalente da tabela de preços</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -631,27 +744,39 @@ st.markdown(
 
 with st.sidebar:
     st.markdown("### Bases de análise")
-    uploaded_sales = st.file_uploader("Faturamento", type=["xlsx", "xlsm", "xls"])
-    uploaded_prices = st.file_uploader("Tabela de preços", type=["xlsx", "xlsm", "xls"])
-    uploaded_mapping = st.file_uploader(
-        "Mapa opcional de produtos",
-        type=["xlsx", "csv"],
-        help="Colunas esperadas: Produto_Faturamento e Produto_Tabela.",
+    st.caption(
+        "Sem upload, o app usa automaticamente os arquivos fixos salvos no Git. "
+        "Um upload substitui a base apenas durante a sessão."
     )
+    with st.expander("Substituir bases temporariamente", expanded=False):
+        uploaded_sales = st.file_uploader("Faturamento", type=["xlsx", "xlsm", "xls"])
+        uploaded_prices = st.file_uploader("Tabela de preços", type=["xlsx", "xlsm", "xls"])
+        uploaded_mapping = st.file_uploader(
+            "Mapa opcional de produtos",
+            type=["xlsx", "csv"],
+            help="Colunas esperadas: Produto_Faturamento e Produto_Tabela.",
+        )
 
 sales_source = uploaded_or_local(
     uploaded_sales,
-    ["rfateqp01.xlsx", "RFATEQP01.xlsx", "faturamento.xlsx", "Faturamento.xlsx"],
+    [
+        "bases/rfateqp01.xlsx", "rfateqp01.xlsx", "RFATEQP01.xlsx",
+        "bases/faturamento.xlsx", "faturamento.xlsx", "Faturamento.xlsx",
+    ],
 )
 price_source = uploaded_or_local(
     uploaded_prices,
-    ["Tabela de Precos.xlsx", "Tabela de Precos(4).xlsx", "tabela_precos.xlsx"],
+    [
+        "bases/Tabela de Precos(4).xlsx", "Tabela de Precos(4).xlsx",
+        "bases/Tabela de Precos.xlsx", "Tabela de Precos.xlsx",
+        "bases/tabela_precos.xlsx", "tabela_precos.xlsx",
+    ],
 )
 
 if sales_source is None or price_source is None:
     st.info(
-        "Envie o arquivo de faturamento e a tabela de preços na lateral. "
-        "O app também reconhece arquivos locais com os nomes padrão."
+        "Inclua no Git os arquivos `bases/rfateqp01.xlsx` e "
+        "`bases/Tabela de Precos(4).xlsx`, ou envie as bases na lateral."
     )
     st.stop()
 
@@ -660,6 +785,12 @@ try:
         sales_sheet, sales_raw = locate_faturamento_sheet(sales_source)
         price_sheet, price_raw = locate_price_sheet(price_source)
         sales = prepare_sales(sales_raw)
+        manager_map_source = local_source([
+            "bases/mapa_gerentes.csv", "mapa_gerentes.csv",
+            "bases/mapa_gerentes.xlsx", "mapa_gerentes.xlsx",
+        ])
+        manager_mapping = prepare_manager_mapping(manager_map_source)
+        sales = apply_manager_mapping(sales, manager_mapping)
         price_table = prepare_price_table(price_raw)
         manual_mapping = prepare_manual_mapping(uploaded_mapping)
 except Exception as exc:
@@ -697,7 +828,7 @@ with st.sidebar:
         "Finalidades incluídas",
         sale_operations,
         default=sale_operations,
-        help="O app já exclui locação, remessa, serviço e demais operações que não começam por VENDA.",
+        help="O app já exclui operações que não começam por VENDA.",
     )
 
     valid_dates = sales["Data"].dropna()
@@ -714,11 +845,29 @@ with st.sidebar:
     else:
         selected_dates = None
 
+    st.markdown("### Filtros principais")
+    available_nfs = sorted([x for x in sales["Nota_Fiscal"].unique() if str(x).strip()])
+    available_sellers = sorted([x for x in sales["Vendedor"].unique() if str(x).strip()])
+    available_managers = sorted([x for x in sales["Gerente"].unique() if str(x).strip()])
+    selected_nfs = st.multiselect("Nota fiscal", available_nfs, placeholder="Todas as NFs")
+    selected_sellers_global = st.multiselect(
+        "Vendedor", available_sellers, placeholder="Todos os vendedores"
+    )
+    selected_managers_global = st.multiselect(
+        "Gerente", available_managers, placeholder="Todos os gerentes"
+    )
+
     st.divider()
-    st.caption(f"Faturamento: {sales_source.name} • aba {sales_sheet}")
-    st.caption(f"Tabela: {price_source.name} • aba {price_sheet}")
+    sales_origin = "upload temporário" if uploaded_sales is not None else "arquivo fixo do Git"
+    price_origin = "upload temporário" if uploaded_prices is not None else "arquivo fixo do Git"
+    st.caption(f"Faturamento: {sales_source.name} • {sales_origin} • aba {sales_sheet}")
+    st.caption(f"Tabela: {price_source.name} • {price_origin} • aba {price_sheet}")
+    if manager_mapping:
+        st.success(f"{len(manager_mapping)} vendedor(es) com gerente definido no mapa fixo.")
+    else:
+        st.caption("Gerente lido da coluna Nome Espec.; o mapa_gerentes.csv pode substituir essa regra.")
     if manual_mapping:
-        st.success(f"{len(manual_mapping)} mapeamento(s) manual(is) carregado(s).")
+        st.success(f"{len(manual_mapping)} mapeamento(s) manual(is) de produto carregado(s).")
 
 filtered_sales = sales[sales["Finalidade"].isin(selected_operations)].copy()
 if selected_dates and isinstance(selected_dates, (tuple, list)) and len(selected_dates) == 2:
@@ -726,12 +875,22 @@ if selected_dates and isinstance(selected_dates, (tuple, list)) and len(selected
     filtered_sales = filtered_sales[
         filtered_sales["Data"].dt.date.between(start_date, end_date, inclusive="both")
     ].copy()
+if selected_nfs:
+    filtered_sales = filtered_sales[filtered_sales["Nota_Fiscal"].isin(selected_nfs)].copy()
+if selected_sellers_global:
+    filtered_sales = filtered_sales[
+        filtered_sales["Vendedor"].isin(selected_sellers_global)
+    ].copy()
+if selected_managers_global:
+    filtered_sales = filtered_sales[
+        filtered_sales["Gerente"].isin(selected_managers_global)
+    ].copy()
 
 if filtered_sales.empty:
     st.warning("Nenhuma venda encontrada para os filtros selecionados.")
     st.stop()
 
-with st.spinner("Cruzando produtos e calculando as variações..."):
+with st.spinner("Cruzando produtos e calculando as variações sobre o valor bruto..."):
     analysis = compare_prices(
         filtered_sales,
         price_table,
@@ -740,11 +899,15 @@ with st.spinner("Cruzando produtos e calculando as variações..."):
         manual_mapping,
     )
 
-valid = analysis[analysis["Preco_Tabela"].notna() & (analysis["Preco_Tabela"] > 0)].copy()
-pending = analysis[analysis["Preco_Tabela"].isna() | (analysis["Preco_Tabela"] <= 0)].copy()
+valid = analysis[
+    analysis["Preco_Tabela"].notna() & (analysis["Valor_Tabela"] > 0)
+].copy()
+pending = analysis[
+    analysis["Preco_Tabela"].isna() | (analysis["Valor_Tabela"] <= 0)
+].copy()
 
-revenue_total = analysis["Valor_Venda"].sum()
-matched_revenue = valid["Valor_Venda"].sum()
+revenue_total = analysis["Valor_Realizado"].sum()
+matched_revenue = valid["Valor_Realizado"].sum()
 reference_total = valid["Valor_Tabela"].sum()
 impact_total = valid["Impacto_Total"].sum()
 weighted_variation = matched_revenue / reference_total - 1 if reference_total else np.nan
@@ -769,7 +932,7 @@ tab_summary, tab_detail, tab_pending, tab_method = st.tabs(
 
 with tab_summary:
     k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Faturamento de vendas", fmt_currency(revenue_total))
+    k1.metric("Valor bruto das vendas", fmt_currency(revenue_total))
     k2.metric("Valor equivalente da tabela", fmt_currency(reference_total))
     k3.metric(
         "Ganho/perda vs tabela",
@@ -781,9 +944,9 @@ with tab_summary:
     k5.metric("Cobertura do cruzamento", fmt_percent(coverage_rows))
 
     st.caption(
-        f"A variação ponderada considera apenas os itens com preço de referência. "
+        f"A variação ponderada considera o valor bruto apenas dos itens com preço de referência. "
         f"Cobertura por valor: {fmt_percent(coverage_revenue)}. "
-        "A margem exibida é comercial frente à tabela, não margem bruta contábil."
+        "A margem exibida é a diferença comercial do valor bruto frente à tabela, não margem bruta contábil."
     )
 
     if pending.empty:
@@ -813,7 +976,7 @@ with tab_summary:
         }
         status_summary = (
             valid.groupby("Status", dropna=False)
-            .agg(Itens=("Produto", "size"), Valor=("Valor_Venda", "sum"))
+            .agg(Itens=("Produto", "size"), Valor=("Valor_Realizado", "sum"))
             .reindex(status_order)
             .dropna(how="all")
             .reset_index()
@@ -836,7 +999,7 @@ with tab_summary:
         monthly = (
             valid.dropna(subset=["Mes"])
             .groupby("Mes", as_index=False)
-            .agg(Vendido=("Valor_Venda", "sum"), Tabela=("Valor_Tabela", "sum"))
+            .agg(Vendido=("Valor_Realizado", "sum"), Tabela=("Valor_Tabela", "sum"))
         )
         if not monthly.empty:
             melted = monthly.melt("Mes", var_name="Série", value_name="Valor")
@@ -849,7 +1012,7 @@ with tab_summary:
                 color_discrete_map={"Vendido": FIRST_BLUE_2, "Tabela": GRAY},
             )
             fig.update_yaxes(tickprefix="R$ ", tickformat=".2s")
-            fig = chart_layout(fig, "Preço realizado x tabela por mês")
+            fig = chart_layout(fig, "Valor bruto realizado x tabela por mês")
             st.plotly_chart(fig, use_container_width=True)
 
     left, right = st.columns(2)
@@ -857,14 +1020,14 @@ with tab_summary:
         seller_summary = (
             valid.groupby("Vendedor", as_index=False)
             .agg(
-                Faturamento=("Valor_Venda", "sum"),
+                Faturamento_Bruto=("Valor_Realizado", "sum"),
                 Tabela=("Valor_Tabela", "sum"),
                 Impacto=("Impacto_Total", "sum"),
             )
         )
         seller_summary["Variacao"] = np.where(
             seller_summary["Tabela"] > 0,
-            seller_summary["Faturamento"] / seller_summary["Tabela"] - 1,
+            seller_summary["Faturamento_Bruto"] / seller_summary["Tabela"] - 1,
             np.nan,
         )
         seller_summary = seller_summary.sort_values("Impacto").tail(15)
@@ -877,7 +1040,7 @@ with tab_summary:
                 orientation="h",
                 color="Cor",
                 color_discrete_map={"Positivo": POSITIVE, "Negativo": NEGATIVE},
-                custom_data=["Faturamento", "Tabela", "Variacao"],
+                custom_data=["Faturamento_Bruto", "Tabela", "Variacao"],
             )
             fig.update_traces(
                 hovertemplate=(
@@ -895,7 +1058,7 @@ with tab_summary:
     with right:
         negative_products = (
             valid.groupby(["Produto", "Descricao_Produto"], as_index=False)
-            .agg(Impacto=("Impacto_Total", "sum"), Faturamento=("Valor_Venda", "sum"))
+            .agg(Impacto=("Impacto_Total", "sum"), Faturamento_Bruto=("Valor_Realizado", "sum"))
             .sort_values("Impacto")
             .head(15)
         )
@@ -921,9 +1084,9 @@ with tab_summary:
         st.success("Nenhum item foi vendido mais de 10% abaixo da referência selecionada.")
     else:
         top_attention = (
-            attention.groupby(["Vendedor", "Cliente", "Produto", "Descricao_Produto"], as_index=False)
+            attention.groupby(["Gerente", "Vendedor", "Cliente", "Produto", "Descricao_Produto"], as_index=False)
             .agg(
-                Faturamento=("Valor_Venda", "sum"),
+                Faturamento_Bruto=("Valor_Realizado", "sum"),
                 Valor_Tabela=("Valor_Tabela", "sum"),
                 Impacto=("Impacto_Total", "sum"),
                 Menor_Variacao=("Variacao", "min"),
@@ -938,7 +1101,7 @@ with tab_summary:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Faturamento": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Faturamento_Bruto": st.column_config.NumberColumn("Faturamento bruto", format="R$ %.2f"),
                 "Valor_Tabela": st.column_config.NumberColumn("Tabela", format="R$ %.2f"),
                 "Impacto": st.column_config.NumberColumn(format="R$ %.2f"),
                 "Menor_Variacao": st.column_config.NumberColumn("Menor variação", format="%.1f%%"),
@@ -947,20 +1110,24 @@ with tab_summary:
 
 with tab_detail:
     st.markdown("### Filtros da análise detalhada")
-    f1, f2, f3, f4 = st.columns(4)
+    f1, f2, f3, f4, f5 = st.columns(5)
     sellers = sorted([x for x in analysis["Vendedor"].dropna().unique() if str(x).strip()])
+    managers = sorted([x for x in analysis["Gerente"].dropna().unique() if str(x).strip()])
     segments = sorted([x for x in analysis["Segmento"].dropna().unique() if str(x).strip()])
     statuses = sorted([x for x in analysis["Status"].dropna().unique() if str(x).strip()])
     methods = sorted([x for x in analysis["Metodo_Cruzamento"].dropna().unique() if str(x).strip()])
     selected_sellers = f1.multiselect("Vendedor", sellers)
-    selected_segments = f2.multiselect("Segmento", segments)
-    selected_statuses = f3.multiselect("Status", statuses)
-    selected_methods = f4.multiselect("Cruzamento", methods)
-    search = st.text_input("Buscar cliente, produto, descrição, pedido ou nota fiscal")
+    selected_managers = f2.multiselect("Gerente", managers)
+    selected_segments = f3.multiselect("Segmento", segments)
+    selected_statuses = f4.multiselect("Status", statuses)
+    selected_methods = f5.multiselect("Cruzamento", methods)
+    search = st.text_input("Buscar cliente, vendedor, gerente, produto, pedido ou nota fiscal")
 
     detail = analysis.copy()
     if selected_sellers:
         detail = detail[detail["Vendedor"].isin(selected_sellers)]
+    if selected_managers:
+        detail = detail[detail["Gerente"].isin(selected_managers)]
     if selected_segments:
         detail = detail[detail["Segmento"].isin(selected_segments)]
     if selected_statuses:
@@ -970,7 +1137,7 @@ with tab_detail:
     if search.strip():
         needle = normalize_text(search)
         haystack = (
-            detail[["Cliente", "Produto", "Descricao_Produto", "Pedido", "Nota_Fiscal"]]
+            detail[["Cliente", "Vendedor", "Gerente", "Produto", "Descricao_Produto", "Pedido", "Nota_Fiscal"]]
             .fillna("")
             .astype(str)
             .agg(" ".join, axis=1)
@@ -979,9 +1146,10 @@ with tab_detail:
         detail = detail[haystack.str.contains(re.escape(needle), na=False)]
 
     display_columns = [
-        "Data", "Nota_Fiscal", "Pedido", "Finalidade", "Cliente", "UF", "Vendedor",
-        "Produto", "Produto_Tabela", "Descricao_Produto", "Quantidade", "Preco_Vendido",
-        "Preco_Tabela", "Variacao", "Diferenca_Unit", "Impacto_Total", "Status",
+        "Data", "Nota_Fiscal", "Pedido", "Finalidade", "Cliente", "UF", "Vendedor", "Gerente",
+        "Produto", "Produto_Tabela", "Descricao_Produto", "Quantidade", "Valor_Bruto",
+        "Valor_Tabela", "Preco_Tabela", "Variacao", "Diferenca_Total",
+        "Impacto_Total", "Status",
         "Metodo_Cruzamento",
     ]
     detail_display = detail[display_columns].sort_values(
@@ -998,10 +1166,11 @@ with tab_detail:
             "Nota_Fiscal": "NF",
             "Produto_Tabela": "Produto tabela",
             "Descricao_Produto": "Descrição",
-            "Preco_Vendido": st.column_config.NumberColumn("Preço vendido", format="R$ %.2f"),
+            "Valor_Bruto": st.column_config.NumberColumn("Valor bruto", format="R$ %.2f"),
+            "Valor_Tabela": st.column_config.NumberColumn("Valor tabela", format="R$ %.2f"),
             "Preco_Tabela": st.column_config.NumberColumn("Preço tabela", format="R$ %.2f"),
             "Variacao": st.column_config.NumberColumn("Variação", format="%.1f%%"),
-            "Diferenca_Unit": st.column_config.NumberColumn("Diferença unitária", format="R$ %.2f"),
+            "Diferenca_Total": st.column_config.NumberColumn("Diferença total", format="R$ %.2f"),
             "Impacto_Total": st.column_config.NumberColumn("Impacto total", format="R$ %.2f"),
             "Metodo_Cruzamento": "Cruzamento",
         },
@@ -1042,10 +1211,10 @@ with tab_pending:
             .agg(
                 Linhas=("Produto", "size"),
                 Quantidade=("Quantidade", "sum"),
-                Faturamento=("Valor_Venda", "sum"),
+                Faturamento_Bruto=("Valor_Realizado", "sum"),
             )
             .reset_index()
-            .sort_values("Faturamento", ascending=False)
+            .sort_values("Faturamento_Bruto", ascending=False)
         )
         pending_summary["Sugestao"] = pending_summary["Produto"].map(
             lambda code: suggestion_for_code(code, table_products)
@@ -1058,7 +1227,7 @@ with tab_pending:
             column_config={
                 "Descricao_Produto": "Descrição",
                 "Metodo_Cruzamento": "Situação",
-                "Faturamento": st.column_config.NumberColumn(format="R$ %.2f"),
+                "Faturamento_Bruto": st.column_config.NumberColumn("Faturamento bruto", format="R$ %.2f"),
                 "Sugestao": "Possíveis códigos",
             },
         )
@@ -1082,20 +1251,20 @@ with tab_method:
         **1. Operações analisadas**  
         São consideradas apenas as linhas cuja coluna **Finalidade começa por “VENDA”**. Assim, locação, cobrança, remessa, devolução e serviço não entram no cálculo. Remessas de venda para entrega futura também não entram, pois começam por “REM”.
 
-        **2. Preço efetivamente vendido**  
-        O app utiliza o primeiro conjunto de colunas do relatório: **Produto, Quantidade, Prc Unitario e Vlr.Total**. No modelo atual, as colunas duplicadas ao final do relatório estão zeradas nas vendas.
+        **2. Valor realizado**  
+        O comparativo utiliza a coluna **Valor Bruto** do item faturado. Quando essa coluna estiver vazia ou zerada, o app usa **Vlr.Total** apenas como fallback e identifica essa origem no relatório exportado.
 
-        **3. Preço de referência**  
-        A tabela é filtrada pelo **TIPO_PRECO** escolhido. Depois, o preço é obtido pela UF do cliente, por Consumidor Final ou pela coluna 4%, conforme a configuração.
+        **3. Valor de referência**  
+        A tabela é filtrada pelo **TIPO_PRECO** escolhido. O preço unitário de referência é obtido pela UF do cliente, por Consumidor Final ou pela coluna 4%. Em seguida, o app calcula **preço tabela × quantidade** para chegar ao valor total comparável.
 
         **4. Cruzamento dos produtos**  
         A ordem é: código exato; código com pontuação ignorada; código-base com sufixos como `_RV`, `_TC`, `_AT`, `_01` e similares ignorados; e equivalente único. Se houver mais de um candidato, o item fica como ambíguo e não entra no cálculo.
 
         **5. Indicadores**  
-        - **Variação:** preço vendido ÷ preço tabela − 1.  
-        - **Ganho/perda unitária:** preço vendido − preço tabela.  
-        - **Ganho/perda total:** valor vendido − valor equivalente da tabela.  
-        - **Margem comercial vs tabela:** faturamento cruzado ÷ valor de tabela cruzado − 1.  
+        - **Variação:** valor bruto realizado ÷ valor equivalente da tabela − 1.  
+        - **Ganho/perda total:** valor bruto realizado − valor equivalente da tabela.  
+        - **Margem comercial vs tabela:** valor bruto cruzado ÷ valor de tabela cruzado − 1.  
+        - **Gerente:** o app prioriza o arquivo fixo **bases/mapa_gerentes.csv**; quando não houver mapeamento, utiliza a coluna **Nome Espec.** do relatório. Registros vazios aparecem como **NÃO INFORMADO**.
 
         A margem apresentada não é a margem bruta contábil, porque as bases fornecidas não possuem custo do produto.
         """
