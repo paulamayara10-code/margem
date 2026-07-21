@@ -106,6 +106,40 @@ def canonical_code(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]", "", normalize_text(value))
 
 
+def normalize_client_code(value: Any) -> str:
+    """Normaliza o código do cliente sem remover zeros à esquerda."""
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    text = str(value).strip()
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".", 1)[0]
+    return re.sub(r"[^A-Z0-9]", "", normalize_text(text))
+
+
+def normalize_client_type(value: Any) -> str:
+    normalized = normalize_text(value)
+    if "REVENDEDOR" in normalized:
+        return "Revendedor"
+    if "CONS" in normalized and "FINAL" in normalized:
+        return "Consumidor Final"
+    if "SOLIDARIO" in normalized:
+        return "Solidário"
+    if "EXPORT" in normalized:
+        return "Exportação"
+    if "PRODUTOR" in normalized and "RURAL" in normalized:
+        return "Produtor Rural"
+    return normalized.title() if normalized else "Não informado"
+
+
+def reference_rule_for_client_type(client_type: Any) -> str:
+    normalized = normalize_client_type(client_type)
+    if normalized == "Revendedor":
+        return "Preço por UF"
+    if normalized == "Consumidor Final":
+        return "Consumidor Final"
+    return ""
+
+
 def base_code(value: Any) -> str:
     """Remove somente sufixos de versão claros, preservando o código principal."""
     text = normalize_text(value).replace(" ", "")
@@ -209,15 +243,28 @@ def workbook_sheet_names(content: bytes) -> list[str]:
 
 
 @st.cache_data(show_spinner=False)
-def read_excel_sheet(content: bytes, sheet_name: str) -> pd.DataFrame:
+def read_excel_sheet(content: bytes, sheet_name: str, header: int = 0) -> pd.DataFrame:
     frame = pd.read_excel(
         io.BytesIO(content),
         sheet_name=sheet_name,
+        header=header,
         dtype=object,
         engine="openpyxl",
     )
     frame.columns = [clean_column_name(c) for c in frame.columns]
     return frame
+
+
+@st.cache_data(show_spinner=False)
+def read_excel_preview(content: bytes, sheet_name: str, rows: int = 8) -> pd.DataFrame:
+    return pd.read_excel(
+        io.BytesIO(content),
+        sheet_name=sheet_name,
+        header=None,
+        nrows=rows,
+        dtype=object,
+        engine="openpyxl",
+    )
 
 
 def locate_faturamento_sheet(source: SourceFile) -> tuple[str, pd.DataFrame]:
@@ -249,6 +296,17 @@ def locate_price_sheet(source: SourceFile) -> tuple[str, pd.DataFrame]:
         if {"PRODUTO", "TIPO_PRECO"}.issubset(normalized):
             return sheet, frame
     raise ValueError("Não encontrei a aba Tabela_UF com Produto e TIPO_PRECO.")
+
+
+def locate_client_sheet(source: SourceFile) -> tuple[str, pd.DataFrame]:
+    required = {"CODIGO", "LOJA", "NOME", "TIPO"}
+    for sheet in workbook_sheet_names(source.content):
+        preview = read_excel_preview(source.content, sheet, rows=10)
+        for header_idx, row in preview.iterrows():
+            normalized = {normalize_text(value) for value in row.tolist() if pd.notna(value)}
+            if required.issubset(normalized):
+                return sheet, read_excel_sheet(source.content, sheet, header=int(header_idx))
+    raise ValueError("Não encontrei no cadastro as colunas Codigo, Loja, Nome e Tipo.")
 
 
 def prepare_sales(raw: pd.DataFrame) -> pd.DataFrame:
@@ -327,6 +385,8 @@ def prepare_sales(raw: pd.DataFrame) -> pd.DataFrame:
 
     out["Gerente"] = out["Gerente"].replace("", "NÃO INFORMADO")
     out["UF"] = out["UF"].map(normalize_text)
+    out["Cliente_Codigo_Chave"] = out["Cliente_Codigo"].map(normalize_client_code)
+    out["Cliente_Nome_Chave"] = out["Cliente"].map(canonical_code)
     out["Produto_Canonico"] = out["Produto"].map(canonical_code)
     out["Produto_Base"] = out["Produto"].map(base_code)
     out = out[(out["Produto_Canonico"] != "") & (out["Valor_Realizado"] > 0)].copy()
@@ -371,6 +431,141 @@ def prepare_price_table(raw: pd.DataFrame) -> pd.DataFrame:
         df[column] = df[column].fillna("").astype(str).str.strip()
 
     return df
+
+
+def prepare_clients(raw: pd.DataFrame) -> pd.DataFrame:
+    df = raw.copy()
+    df.columns = [clean_column_name(c) for c in df.columns]
+    aliases = {
+        "Cliente_Codigo_Cadastro": ["Codigo", "Código"],
+        "Cliente_Loja_Cadastro": ["Loja"],
+        "Cliente_Nome_Cadastro": ["Nome", "Razao Social", "Razão Social"],
+        "Cliente_Fantasia_Cadastro": ["N Fantasia", "Nome Fantasia"],
+        "Cliente_CNPJ_Cadastro": ["CNPJ/CPF", "CNPJ", "CPF"],
+        "Tipo_Cliente_Original": ["Tipo"],
+        "UF_Cadastro": ["Estado", "UF"],
+    }
+    out = pd.DataFrame(index=df.index)
+    for target, options in aliases.items():
+        column = first_existing(df.columns, options)
+        out[target] = df[column] if column else ""
+
+    for column in out.columns:
+        out[column] = out[column].fillna("").astype(str).str.strip()
+    out["Cliente_Codigo_Chave"] = out["Cliente_Codigo_Cadastro"].map(normalize_client_code)
+    out["Cliente_Nome_Chave"] = out["Cliente_Nome_Cadastro"].map(canonical_code)
+    out["Tipo_Cliente"] = out["Tipo_Cliente_Original"].map(normalize_client_type)
+    out["UF_Cadastro"] = out["UF_Cadastro"].map(normalize_text)
+    out = out[out["Cliente_Codigo_Chave"] != ""].copy()
+    out.reset_index(drop=True, inplace=True)
+    return out
+
+
+def prepare_client_overrides(source: SourceFile | None) -> dict[str, str]:
+    if source is None:
+        return {}
+    try:
+        if source.name.lower().endswith(".csv"):
+            frame = pd.read_csv(io.BytesIO(source.content), sep=None, engine="python", dtype=str)
+        else:
+            frame = pd.read_excel(io.BytesIO(source.content), dtype=str, engine="openpyxl")
+    except Exception:
+        return {}
+    frame.columns = [clean_column_name(c) for c in frame.columns]
+    code_col = first_existing(frame.columns, ["Cliente_Codigo", "Codigo", "Código", "Cliente"])
+    type_col = first_existing(frame.columns, ["Tipo_Cliente", "Tipo Cliente", "Tipo"])
+    if not code_col or not type_col:
+        return {}
+    result: dict[str, str] = {}
+    for code, client_type in frame[[code_col, type_col]].fillna("").itertuples(index=False, name=None):
+        key = normalize_client_code(code)
+        normalized_type = normalize_client_type(client_type)
+        if key and normalized_type != "Não informado":
+            result[key] = normalized_type
+    return result
+
+
+def apply_client_registry(
+    sales: pd.DataFrame,
+    clients: pd.DataFrame,
+    overrides: dict[str, str],
+) -> pd.DataFrame:
+    groups = {
+        key: group.copy()
+        for key, group in clients.groupby("Cliente_Codigo_Chave", dropna=False)
+        if key
+    }
+    rows: list[dict[str, Any]] = []
+    for record in sales.to_dict("records"):
+        result = dict(record)
+        code_key = record.get("Cliente_Codigo_Chave", "")
+        result.update({
+            "Tipo_Cliente": "Não encontrado",
+            "Tipo_Cliente_Original": "",
+            "Cliente_Cadastro_Status": "NÃO ENCONTRADO",
+            "Cliente_Loja_Cadastro": "",
+            "Cliente_CNPJ_Cadastro": "",
+            "Cliente_Nome_Cadastro": "",
+            "Referencia_Cadastro": "",
+        })
+
+        override_type = overrides.get(code_key)
+        if override_type:
+            result["Tipo_Cliente"] = override_type
+            result["Tipo_Cliente_Original"] = override_type
+            result["Cliente_Cadastro_Status"] = "EXCEÇÃO MANUAL"
+            result["Referencia_Cadastro"] = reference_rule_for_client_type(override_type)
+            rows.append(result)
+            continue
+
+        candidates = groups.get(code_key)
+        if candidates is None or candidates.empty:
+            rows.append(result)
+            continue
+
+        selected = candidates.sort_values("Cliente_Loja_Cadastro").iloc[0]
+        distinct_types = sorted(set(candidates["Tipo_Cliente"].dropna().astype(str)))
+        status = "CÓDIGO — TIPO ÚNICO"
+
+        if len(distinct_types) > 1:
+            sale_uf = normalize_text(record.get("UF", ""))
+            by_uf = candidates[candidates["UF_Cadastro"] == sale_uf]
+            uf_types = sorted(set(by_uf["Tipo_Cliente"].dropna().astype(str)))
+            if not by_uf.empty and len(uf_types) == 1:
+                selected = by_uf.sort_values("Cliente_Loja_Cadastro").iloc[0]
+                distinct_types = uf_types
+                status = "CÓDIGO + UF"
+            else:
+                sold_name = record.get("Cliente_Nome_Chave", "")
+                name_pool = by_uf if not by_uf.empty else candidates
+                by_name = name_pool[
+                    name_pool["Cliente_Nome_Chave"].map(
+                        lambda name: bool(sold_name) and (name.startswith(sold_name) or sold_name.startswith(name))
+                    )
+                ]
+                name_types = sorted(set(by_name["Tipo_Cliente"].dropna().astype(str)))
+                if not by_name.empty and len(name_types) == 1:
+                    selected = by_name.sort_values("Cliente_Loja_Cadastro").iloc[0]
+                    distinct_types = name_types
+                    status = "CÓDIGO + NOME"
+                else:
+                    result["Tipo_Cliente"] = "Ambíguo"
+                    result["Tipo_Cliente_Original"] = " / ".join(distinct_types)
+                    result["Cliente_Cadastro_Status"] = "AMBÍGUO — INFORMAR LOJA OU EXCEÇÃO"
+                    rows.append(result)
+                    continue
+
+        resolved_type = distinct_types[0] if distinct_types else "Não informado"
+        result["Tipo_Cliente"] = resolved_type
+        result["Tipo_Cliente_Original"] = str(selected.get("Tipo_Cliente_Original", ""))
+        result["Cliente_Cadastro_Status"] = status
+        result["Cliente_Loja_Cadastro"] = str(selected.get("Cliente_Loja_Cadastro", ""))
+        result["Cliente_CNPJ_Cadastro"] = str(selected.get("Cliente_CNPJ_Cadastro", ""))
+        result["Cliente_Nome_Cadastro"] = str(selected.get("Cliente_Nome_Cadastro", ""))
+        result["Referencia_Cadastro"] = reference_rule_for_client_type(resolved_type)
+        rows.append(result)
+
+    return pd.DataFrame(rows)
 
 
 def prepare_manual_mapping(uploaded: Any) -> dict[str, str]:
@@ -515,6 +710,27 @@ def classify_variation(value: float | None) -> str:
     return "MAIS DE 10% ABAIXO"
 
 
+def resolve_reference_column(record: dict[str, Any], reference_mode: str) -> tuple[str, str, str]:
+    if reference_mode == "Automático pelo cadastro":
+        registry_rule = str(record.get("Referencia_Cadastro", ""))
+        client_type = str(record.get("Tipo_Cliente", ""))
+        client_status = str(record.get("Cliente_Cadastro_Status", ""))
+        if registry_rule == "Preço por UF":
+            return str(record.get("UF", "")), "CADASTRO — REVENDEDOR", "OK"
+        if registry_rule == "Consumidor Final":
+            return "Consumidor Final", "CADASTRO — CONSUMIDOR FINAL", "OK"
+        if client_type == "Ambíguo":
+            return "", "CADASTRO", client_status or "TIPO DE CLIENTE AMBÍGUO"
+        if client_type == "Não encontrado":
+            return "", "CADASTRO", "CLIENTE NÃO ENCONTRADO NO MATR021"
+        return "", "CADASTRO", f"TIPO SEM REGRA AUTOMÁTICA: {client_type or 'Não informado'}"
+    if reference_mode == "Preço por UF":
+        return str(record.get("UF", "")), "FORÇADO PELO FILTRO", "OK"
+    if reference_mode == "Consumidor Final":
+        return "Consumidor Final", "FORÇADO PELO FILTRO", "OK"
+    return "4%", "FORÇADO PELO FILTRO", "OK"
+
+
 def compare_prices(
     sales: pd.DataFrame,
     table: pd.DataFrame,
@@ -541,7 +757,16 @@ def compare_prices(
         result["Descricao_Tabela"] = ""
         result["Atualizado_Em"] = pd.NaT
         result["Coluna_Referencia"] = ""
+        result["Regra_Referencia"] = ""
+        result["Status_Referencia"] = ""
         result["Preco_Tabela"] = np.nan
+
+        reference_column, reference_rule, reference_status = resolve_reference_column(
+            record, reference_mode
+        )
+        result["Coluna_Referencia"] = reference_column
+        result["Regra_Referencia"] = reference_rule
+        result["Status_Referencia"] = reference_status
 
         if matched is not None:
             result["Produto_Tabela"] = str(matched.get("Produto", ""))
@@ -551,15 +776,15 @@ def compare_prices(
             result["Descricao_Tabela"] = str(matched.get("Descrição", ""))
             result["Atualizado_Em"] = matched.get("Atualizado_Em", pd.NaT)
 
-            if reference_mode == "Preço por UF":
-                reference_column = record["UF"]
-            elif reference_mode == "Consumidor Final":
-                reference_column = "Consumidor Final"
-            else:
-                reference_column = "4%"
-            result["Coluna_Referencia"] = reference_column
-            price = matched.get(reference_column, np.nan)
-            result["Preco_Tabela"] = pd.to_numeric(pd.Series([price]), errors="coerce").iloc[0]
+            if reference_column:
+                if reference_column not in matched.index:
+                    result["Status_Referencia"] = f"COLUNA DE PREÇO INEXISTENTE: {reference_column}"
+                else:
+                    price = matched.get(reference_column, np.nan)
+                    numeric_price = pd.to_numeric(pd.Series([price]), errors="coerce").iloc[0]
+                    result["Preco_Tabela"] = numeric_price
+                    if pd.isna(numeric_price) or numeric_price <= 0:
+                        result["Status_Referencia"] = f"PREÇO VAZIO OU ZERADO: {reference_column}"
 
         rows.append(result)
 
@@ -635,19 +860,37 @@ def make_excel_export(analysis: pd.DataFrame) -> bytes:
         np.nan,
     )
 
+    by_client_type = (
+        valid.groupby(["Tipo_Cliente", "Coluna_Referencia"], dropna=False)
+        .agg(
+            Faturamento_Bruto=("Valor_Realizado", "sum"),
+            Valor_Tabela=("Valor_Tabela", "sum"),
+            Impacto=("Impacto_Total", "sum"),
+            Itens=("Produto", "size"),
+        )
+        .reset_index()
+    )
+    by_client_type["Variacao_Ponderada"] = np.where(
+        by_client_type["Valor_Tabela"] != 0,
+        by_client_type["Faturamento_Bruto"] / by_client_type["Valor_Tabela"] - 1,
+        np.nan,
+    )
+
     pending = analysis[
         analysis["Preco_Tabela"].isna() | (analysis["Valor_Tabela"] <= 0)
     ].copy()
 
     export_columns = [
         "Data", "Nota_Fiscal", "Pedido", "Finalidade", "Segmento", "Cliente_Codigo",
-        "Cliente", "UF", "Vendedor", "Gerente", "Produto", "Produto_Tabela",
+        "Cliente", "UF", "Tipo_Cliente", "Tipo_Cliente_Original",
+        "Cliente_Cadastro_Status", "Cliente_Loja_Cadastro", "Cliente_CNPJ_Cadastro",
+        "Vendedor", "Gerente", "Produto", "Produto_Tabela",
         "Descricao_Produto", "Grupo", "Linha", "Classificacao", "Quantidade",
         "Preco_Unitario_Informado", "Preco_Realizado_Bruto", "Preco_Tabela",
         "Valor_Liquido", "Valor_Bruto", "Valor_Realizado", "Valor_Tabela",
         "Diferenca_Total", "Impacto_Total", "Variacao", "Status",
         "Fonte_Valor_Realizado", "Gerente_Origem", "Metodo_Cruzamento", "Candidatos", "Tipo_Preco",
-        "Coluna_Referencia", "Atualizado_Em",
+        "Coluna_Referencia", "Regra_Referencia", "Status_Referencia", "Atualizado_Em",
     ]
     export_data = analysis[[c for c in export_columns if c in analysis.columns]].copy()
 
@@ -657,6 +900,7 @@ def make_excel_export(analysis: pd.DataFrame) -> bytes:
         by_seller.to_excel(writer, sheet_name="Resumo_Vendedor", index=False)
         by_manager.to_excel(writer, sheet_name="Resumo_Gerente", index=False)
         by_product.to_excel(writer, sheet_name="Resumo_Produto", index=False)
+        by_client_type.to_excel(writer, sheet_name="Resumo_Tipo_Cliente", index=False)
         pending.to_excel(writer, sheet_name="Pendencias", index=False)
 
         workbook = writer.book
@@ -672,6 +916,7 @@ def make_excel_export(analysis: pd.DataFrame) -> bytes:
             "Resumo_Vendedor": by_seller,
             "Resumo_Gerente": by_manager,
             "Resumo_Produto": by_product,
+            "Resumo_Tipo_Cliente": by_client_type,
             "Pendencias": pending,
         }
         for sheet_name, dataframe in sheets.items():
@@ -751,6 +996,9 @@ with st.sidebar:
     with st.expander("Substituir bases temporariamente", expanded=False):
         uploaded_sales = st.file_uploader("Faturamento", type=["xlsx", "xlsm", "xls"])
         uploaded_prices = st.file_uploader("Tabela de preços", type=["xlsx", "xlsm", "xls"])
+        uploaded_clients = st.file_uploader(
+            "Cadastro de clientes (MATR021)", type=["xlsx", "xlsm", "xls"]
+        )
         uploaded_mapping = st.file_uploader(
             "Mapa opcional de produtos",
             type=["xlsx", "csv"],
@@ -772,11 +1020,20 @@ price_source = uploaded_or_local(
         "bases/tabela_precos.xlsx", "tabela_precos.xlsx",
     ],
 )
+client_source = uploaded_or_local(
+    uploaded_clients,
+    [
+        "bases/matr021.xlsx", "matr021.xlsx",
+        "bases/matr021(1).xlsx", "matr021(1).xlsx",
+        "bases/cadastro_clientes.xlsx", "cadastro_clientes.xlsx",
+    ],
+)
 
 if sales_source is None or price_source is None:
     st.info(
         "Inclua no Git os arquivos `bases/rfateqp01.xlsx` e "
-        "`bases/Tabela de Precos(4).xlsx`, ou envie as bases na lateral."
+        "`bases/Tabela de Precos(4).xlsx`, ou envie as bases na lateral. "
+        "Para a regra automática, inclua também `bases/matr021.xlsx`."
     )
     st.stop()
 
@@ -791,6 +1048,25 @@ try:
         ])
         manager_mapping = prepare_manager_mapping(manager_map_source)
         sales = apply_manager_mapping(sales, manager_mapping)
+        client_sheet = ""
+        clients = pd.DataFrame()
+        client_overrides_source = local_source([
+            "bases/mapa_clientes_excecao.csv", "mapa_clientes_excecao.csv",
+            "bases/mapa_clientes_excecao.xlsx", "mapa_clientes_excecao.xlsx",
+        ])
+        client_overrides = prepare_client_overrides(client_overrides_source)
+        if client_source is not None:
+            client_sheet, clients_raw = locate_client_sheet(client_source)
+            clients = prepare_clients(clients_raw)
+            sales = apply_client_registry(sales, clients, client_overrides)
+        else:
+            sales["Tipo_Cliente"] = "Não encontrado"
+            sales["Tipo_Cliente_Original"] = ""
+            sales["Cliente_Cadastro_Status"] = "CADASTRO NÃO CARREGADO"
+            sales["Cliente_Loja_Cadastro"] = ""
+            sales["Cliente_CNPJ_Cadastro"] = ""
+            sales["Cliente_Nome_Cadastro"] = ""
+            sales["Referencia_Cadastro"] = ""
         price_table = prepare_price_table(price_raw)
         manual_mapping = prepare_manual_mapping(uploaded_mapping)
 except Exception as exc:
@@ -817,10 +1093,17 @@ with st.sidebar:
         index=price_types.index(default_price_type),
         help="Define qual linha da tabela será usada: Venda Direta, Distribuidor ou Representante.",
     )
+    reference_options = [
+        "Automático pelo cadastro", "Preço por UF", "Consumidor Final", "Alíquota 4%"
+    ]
     reference_mode = st.radio(
         "Preço de referência",
-        ["Preço por UF", "Consumidor Final", "Alíquota 4%"],
+        reference_options,
         horizontal=False,
+        help=(
+            "No modo automático: Revendedor usa a coluna da UF e Consumidor Final "
+            "usa a coluna Consumidor Final. O TIPO_PRECO continua definido no filtro acima."
+        ),
     )
 
     sale_operations = sorted(sales["Finalidade"].dropna().unique().tolist())
@@ -849,6 +1132,7 @@ with st.sidebar:
     available_nfs = sorted([x for x in sales["Nota_Fiscal"].unique() if str(x).strip()])
     available_sellers = sorted([x for x in sales["Vendedor"].unique() if str(x).strip()])
     available_managers = sorted([x for x in sales["Gerente"].unique() if str(x).strip()])
+    available_client_types = sorted([x for x in sales["Tipo_Cliente"].unique() if str(x).strip()])
     selected_nfs = st.multiselect("Nota fiscal", available_nfs, placeholder="Todas as NFs")
     selected_sellers_global = st.multiselect(
         "Vendedor", available_sellers, placeholder="Todos os vendedores"
@@ -856,12 +1140,27 @@ with st.sidebar:
     selected_managers_global = st.multiselect(
         "Gerente", available_managers, placeholder="Todos os gerentes"
     )
+    selected_client_types_global = st.multiselect(
+        "Tipo de cliente", available_client_types, placeholder="Todos os tipos"
+    )
 
     st.divider()
     sales_origin = "upload temporário" if uploaded_sales is not None else "arquivo fixo do Git"
     price_origin = "upload temporário" if uploaded_prices is not None else "arquivo fixo do Git"
     st.caption(f"Faturamento: {sales_source.name} • {sales_origin} • aba {sales_sheet}")
     st.caption(f"Tabela: {price_source.name} • {price_origin} • aba {price_sheet}")
+    if client_source is not None:
+        client_origin = "upload temporário" if uploaded_clients is not None else "arquivo fixo do Git"
+        matched_clients = sales[~sales["Tipo_Cliente"].isin(["Não encontrado", "Ambíguo"])]
+        client_coverage = len(matched_clients) / len(sales) if len(sales) else 0
+        st.caption(
+            f"Clientes: {client_source.name} • {client_origin} • aba {client_sheet} • "
+            f"cobertura {client_coverage:.1%}"
+        )
+    else:
+        st.warning("Cadastro MATR021 não encontrado; a regra automática ficará sem referência.")
+    if client_overrides:
+        st.success(f"{len(client_overrides)} exceção(ões) de tipo de cliente carregada(s).")
     if manager_mapping:
         st.success(f"{len(manager_mapping)} vendedor(es) com gerente definido no mapa fixo.")
     else:
@@ -884,6 +1183,10 @@ if selected_sellers_global:
 if selected_managers_global:
     filtered_sales = filtered_sales[
         filtered_sales["Gerente"].isin(selected_managers_global)
+    ].copy()
+if selected_client_types_global:
+    filtered_sales = filtered_sales[
+        filtered_sales["Tipo_Cliente"].isin(selected_client_types_global)
     ].copy()
 
 if filtered_sales.empty:
@@ -1110,17 +1413,19 @@ with tab_summary:
 
 with tab_detail:
     st.markdown("### Filtros da análise detalhada")
-    f1, f2, f3, f4, f5 = st.columns(5)
+    f1, f2, f3, f4, f5, f6 = st.columns(6)
     sellers = sorted([x for x in analysis["Vendedor"].dropna().unique() if str(x).strip()])
     managers = sorted([x for x in analysis["Gerente"].dropna().unique() if str(x).strip()])
     segments = sorted([x for x in analysis["Segmento"].dropna().unique() if str(x).strip()])
     statuses = sorted([x for x in analysis["Status"].dropna().unique() if str(x).strip()])
     methods = sorted([x for x in analysis["Metodo_Cruzamento"].dropna().unique() if str(x).strip()])
+    client_types = sorted([x for x in analysis["Tipo_Cliente"].dropna().unique() if str(x).strip()])
     selected_sellers = f1.multiselect("Vendedor", sellers)
     selected_managers = f2.multiselect("Gerente", managers)
     selected_segments = f3.multiselect("Segmento", segments)
     selected_statuses = f4.multiselect("Status", statuses)
     selected_methods = f5.multiselect("Cruzamento", methods)
+    selected_client_types = f6.multiselect("Tipo cliente", client_types)
     search = st.text_input("Buscar cliente, vendedor, gerente, produto, pedido ou nota fiscal")
 
     detail = analysis.copy()
@@ -1134,6 +1439,8 @@ with tab_detail:
         detail = detail[detail["Status"].isin(selected_statuses)]
     if selected_methods:
         detail = detail[detail["Metodo_Cruzamento"].isin(selected_methods)]
+    if selected_client_types:
+        detail = detail[detail["Tipo_Cliente"].isin(selected_client_types)]
     if search.strip():
         needle = normalize_text(search)
         haystack = (
@@ -1146,11 +1453,11 @@ with tab_detail:
         detail = detail[haystack.str.contains(re.escape(needle), na=False)]
 
     display_columns = [
-        "Data", "Nota_Fiscal", "Pedido", "Finalidade", "Cliente", "UF", "Vendedor", "Gerente",
+        "Data", "Nota_Fiscal", "Pedido", "Finalidade", "Cliente_Codigo", "Cliente", "UF",
+        "Tipo_Cliente", "Cliente_Cadastro_Status", "Coluna_Referencia", "Vendedor", "Gerente",
         "Produto", "Produto_Tabela", "Descricao_Produto", "Quantidade", "Valor_Bruto",
         "Valor_Tabela", "Preco_Tabela", "Variacao", "Diferenca_Total",
-        "Impacto_Total", "Status",
-        "Metodo_Cruzamento",
+        "Impacto_Total", "Status", "Status_Referencia", "Metodo_Cruzamento",
     ]
     detail_display = detail[display_columns].sort_values(
         ["Data", "Impacto_Total"], ascending=[False, True]
@@ -1164,6 +1471,11 @@ with tab_detail:
         column_config={
             "Data": st.column_config.DateColumn("Emissão", format="DD/MM/YYYY"),
             "Nota_Fiscal": "NF",
+            "Cliente_Codigo": "Cód. cliente",
+            "Tipo_Cliente": "Tipo cliente",
+            "Cliente_Cadastro_Status": "Cruzamento cliente",
+            "Coluna_Referencia": "Referência aplicada",
+            "Status_Referencia": "Status referência",
             "Produto_Tabela": "Produto tabela",
             "Descricao_Produto": "Descrição",
             "Valor_Bruto": st.column_config.NumberColumn("Valor bruto", format="R$ %.2f"),
@@ -1197,7 +1509,7 @@ with tab_detail:
 with tab_pending:
     st.markdown("### Itens sem preço de referência")
     st.caption(
-        "Esses itens ficam fora dos indicadores de variação. O app não força um cruzamento quando há risco de usar o produto errado."
+        "Esses itens ficam fora dos indicadores. A pendência pode estar no produto, no tipo de cliente ou na coluna de preço escolhida."
     )
 
     if pending.empty:
@@ -1207,7 +1519,10 @@ with tab_pending:
             price_table.loc[price_table["TIPO_PRECO"] == price_type, "Produto"].astype(str).unique().tolist()
         )
         pending_summary = (
-            pending.groupby(["Produto", "Descricao_Produto", "Metodo_Cruzamento", "Candidatos"], dropna=False)
+            pending.groupby([
+                "Produto", "Descricao_Produto", "Metodo_Cruzamento", "Candidatos",
+                "Tipo_Cliente", "Cliente_Cadastro_Status", "Status_Referencia"
+            ], dropna=False)
             .agg(
                 Linhas=("Produto", "size"),
                 Quantidade=("Quantidade", "sum"),
@@ -1226,7 +1541,10 @@ with tab_pending:
             height=520,
             column_config={
                 "Descricao_Produto": "Descrição",
-                "Metodo_Cruzamento": "Situação",
+                "Metodo_Cruzamento": "Cruzamento produto",
+                "Tipo_Cliente": "Tipo cliente",
+                "Cliente_Cadastro_Status": "Cruzamento cliente",
+                "Status_Referencia": "Status referência",
                 "Faturamento_Bruto": st.column_config.NumberColumn("Faturamento bruto", format="R$ %.2f"),
                 "Sugestao": "Possíveis códigos",
             },
@@ -1254,13 +1572,16 @@ with tab_method:
         **2. Valor realizado**  
         O comparativo utiliza a coluna **Valor Bruto** do item faturado. Quando essa coluna estiver vazia ou zerada, o app usa **Vlr.Total** apenas como fallback e identifica essa origem no relatório exportado.
 
-        **3. Valor de referência**  
-        A tabela é filtrada pelo **TIPO_PRECO** escolhido. O preço unitário de referência é obtido pela UF do cliente, por Consumidor Final ou pela coluna 4%. Em seguida, o app calcula **preço tabela × quantidade** para chegar ao valor total comparável.
+        **3. Cadastro e tipo do cliente**  
+        O app cruza o código do cliente do faturamento com o cadastro **MATR021**. No modo automático, clientes do tipo **Revendedor** usam a coluna da **UF** e clientes do tipo **Consumidor Final** usam a coluna **Consumidor Final**. Quando um mesmo código possui lojas com tipos diferentes, o app tenta resolver pela UF e pelo nome; se ainda houver dúvida, deixa o item pendente em vez de assumir uma regra. Exceções podem ser registradas em **bases/mapa_clientes_excecao.csv**.
 
-        **4. Cruzamento dos produtos**  
+        **4. Valor de referência**  
+        A tabela é filtrada pelo **TIPO_PRECO** escolhido. O cadastro do cliente define apenas a coluna de preço; ele não altera automaticamente Venda Direta, Distribuidor ou Representante. Em seguida, o app calcula **preço tabela × quantidade** para chegar ao valor total comparável.
+
+        **5. Cruzamento dos produtos**  
         A ordem é: código exato; código com pontuação ignorada; código-base com sufixos como `_RV`, `_TC`, `_AT`, `_01` e similares ignorados; e equivalente único. Se houver mais de um candidato, o item fica como ambíguo e não entra no cálculo.
 
-        **5. Indicadores**  
+        **6. Indicadores**  
         - **Variação:** valor bruto realizado ÷ valor equivalente da tabela − 1.  
         - **Ganho/perda total:** valor bruto realizado − valor equivalente da tabela.  
         - **Margem comercial vs tabela:** valor bruto cruzado ÷ valor de tabela cruzado − 1.  

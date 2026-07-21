@@ -1,36 +1,56 @@
 # First Pricing Intelligence
 
-App Streamlit para comparar operações de venda do relatório de faturamento com a tabela de preços por UF.
+App Streamlit para comparar o **Valor Bruto faturado** com o valor equivalente da tabela de preços, considerando somente operações cuja finalidade começa por **VENDA**.
 
-## Arquivos
+## Regra automática pelo cadastro de clientes
 
-- `app_comparativo_precos.py`: aplicação principal.
-- `requirements_comparativo_precos.txt`: dependências.
+O app cruza o campo `Cliente` do relatório RFATEQP01 com o campo `Codigo` do cadastro MATR021.
 
-## Como publicar no Streamlit
+- **Revendedor:** usa o preço da coluna correspondente à **UF** da venda.
+- **Consumidor Final:** usa o preço da coluna **Consumidor Final**.
+- Tipos sem regra definida, clientes não encontrados ou códigos ambíguos ficam em **Pendências** e não distorcem os indicadores.
 
-1. Envie os dois arquivos acima para um repositório GitHub.
-2. Renomeie `requirements_comparativo_precos.txt` para `requirements.txt`.
-3. No Streamlit Community Cloud, selecione `app_comparativo_precos.py` como arquivo principal.
-4. As bases podem ser enviadas pela tela do app. Opcionalmente, podem ficar no repositório com um destes nomes:
-   - `rfateqp01.xlsx`
-   - `Tabela de Precos.xlsx`
+O cadastro define a **coluna de preço**. O filtro `Tipo de preço` continua definindo a linha da tabela: Venda Direta, Distribuidor ou Representante.
 
-## Regras da versão inicial
+Quando um código possui lojas com tipos diferentes, o app tenta resolver pela UF e pelo nome. Casos ainda ambíguos podem ser definidos em `bases/mapa_clientes_excecao.csv`.
 
-- Inclui somente finalidades que começam por `VENDA`.
-- Exclui remessas, locações, serviços e cobranças.
-- Utiliza Produto, Quantidade, Prc Unitario e Vlr.Total do primeiro conjunto de colunas do relatório.
-- Permite escolher Venda Direta, Distribuidor ou Representante.
-- Permite comparar por UF, Consumidor Final ou coluna 4%.
-- Ignora pontuação e sufixos claros de versão, sem forçar cruzamentos ambíguos.
-- Exporta relatório completo em Excel e seleção em CSV.
+## Estrutura para o Git
 
-## Mapa opcional de produtos
+```text
+app.py
+requirements.txt
+README.md
+bases/
+  rfateqp01.xlsx
+  Tabela de Precos(4).xlsx
+  matr021.xlsx
+  mapa_gerentes.csv
+  mapa_clientes_excecao.csv
+```
 
-O app aceita um arquivo CSV ou Excel com as colunas:
+Os três arquivos Excel podem ficar fixos no Git. Para atualizar o app, substitua a base mantendo o mesmo nome e faça um novo commit.
 
-- `Produto_Faturamento`
-- `Produto_Tabela`
+Como as bases contêm informações internas, use um repositório privado.
 
-Use o modelo disponível na aba Pendências do próprio app.
+## Execução local
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## Streamlit Community Cloud
+
+- Branch: `main`
+- Main file path: `app.py`
+
+## Exportação
+
+O relatório Excel contém:
+
+- análise detalhada;
+- resumo por vendedor;
+- resumo por gerente;
+- resumo por produto;
+- resumo por tipo de cliente e referência aplicada;
+- pendências de produto, cliente ou coluna de preço.
